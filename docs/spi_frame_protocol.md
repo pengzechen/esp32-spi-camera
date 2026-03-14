@@ -1,11 +1,13 @@
-# SPI Camera Frame Protocol (SG2002 <-> ESP32-CAM)
+# SPI Camera Frame Protocol (Linux Master <-> ESP32-CAM Slave)
 
 ## 1. Overview
 
-This document defines the SPI communication protocol between an SG2002 (master) and an ESP32-CAM (slave). The protocol is designed to be configurable and robust for transferring camera frames.
+This document defines the SPI communication protocol between a Linux-based
+master and an ESP32-CAM (slave). The protocol is designed to be configurable
+and robust for transferring camera frames.
 
-- **Master**: SG2002
-- **Slave**: ESP32-CAM
+- **Master**: Any Linux SBC (Raspberry Pi, Milk-V Duo / SG2002, Orange Pi, etc.)
+- **Slave**: ESP32-CAM with OV3660 (or OV2640) camera module
 - **Communication**: Half-duplex. The master sends a command, and the slave responds with an acknowledgment or data.
 - **Data Integrity**: CRC checks are used for both commands and data frames to ensure reliability.
 
@@ -106,3 +108,68 @@ If the `FLAGS.bit1` is set, a 4-byte CRC32 checksum of the `Frame Payload` is ap
 8.  **Master**: Master reads the payload and optional trailer, verifying the `DATA_CRC32` if present.
 
 This completes the transfer of a single frame.
+
+---
+
+## 6. Hardware Setup
+
+### ESP32-CAM Slave (AI-Thinker board + OV3660 module)
+
+The OV3660 uses the same physical GPIO pin assignments as the stock OV2640 on
+the AI-Thinker ESP32-CAM. No hardware re-wiring is needed when substituting an
+OV3660 module — the `esp_camera` library auto-detects the sensor over SCCB.
+
+| Signal     | ESP32 GPIO |
+|------------|-----------|
+| PWDN       | 32        |
+| XCLK       | 0         |
+| SIOD (SDA) | 26        |
+| SIOC (SCL) | 27        |
+| D0–D7      | 5,18,19,21,36,39,34,35 |
+| VSYNC      | 25        |
+| HREF       | 23        |
+| PCLK       | 22        |
+| SPI CS     | 15        |
+| SPI SCLK   | 14        |
+| SPI MOSI   | 13        |
+| SPI MISO   | 12        |
+| Handshake  | 16        |
+
+### Linux Master Wiring
+
+Connect the ESP32-CAM SPI pins to the Linux board's SPI controller and one
+free GPIO for the handshake (ready) line:
+
+| Linux board signal | ESP32-CAM |
+|--------------------|-----------|
+| SPI SCLK           | GPIO 14   |
+| SPI MOSI           | GPIO 13   |
+| SPI MISO           | GPIO 12   |
+| SPI CS0            | GPIO 15   |
+| GPIO input (e.g. GPIO 24) | GPIO 16 (Handshake) |
+| GND                | GND       |
+
+### Building and Running the Linux Master
+
+```sh
+# Build
+cd src/linux_master
+make
+
+# Capture a 640×480 JPEG and save it to out.jpg
+sudo ./linux_spi_master -d /dev/spidev0.0 -s 10000000 -g 24 \
+                        -w 640 -h 480 -q 10 -o out.jpg
+```
+
+Available options:
+
+| Option | Default         | Description                          |
+|--------|-----------------|--------------------------------------|
+| `-d`   | /dev/spidev0.0  | SPI device node                      |
+| `-s`   | 10000000        | SPI clock speed in Hz                |
+| `-g`   | 24              | Handshake GPIO number on Linux board |
+| `-w`   | 320             | Requested frame width (pixels)       |
+| `-h`   | 240             | Requested frame height (pixels)      |
+| `-q`   | 12              | JPEG quality (1–63, lower = bigger)  |
+| `-o`   | frame.jpg       | Output file name                     |
+

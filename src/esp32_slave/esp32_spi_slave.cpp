@@ -18,7 +18,10 @@
 static const char *TAG = "ESP32_SPI_SLAVE";
 
 // --- Camera Configuration ---
-// Pin definition for CAMERA_MODEL_AI_THINKER (OV2640)
+// Pin definition for CAMERA_MODEL_AI_THINKER.
+// These board-level GPIO assignments apply to both OV2640 and OV3660 modules
+// on the AI-Thinker ESP32-CAM. The esp_camera library auto-detects the sensor
+// via SCCB; OV3660-specific settings are applied after esp_camera_init().
 #define PWDN_GPIO_NUM     32
 #define RESET_GPIO_NUM    -1
 #define XCLK_GPIO_NUM      0
@@ -48,8 +51,9 @@ static const char *TAG = "ESP32_SPI_SLAVE";
 #define GPIO_HANDSHAKE    16  // Using IO16 (U2RXD) which is typically free on ESP32-CAM
 
 // Allocate a large DMA buffer to send a whole frame in one shot to avoid Master chunking complexity.
-// 60KB should be enough for generic QVGA/VGA JPEG images. 
-#define MAX_FRAME_DMA_BUFFER_SIZE 61440 
+// 128 KB accommodates OV3660 JPEG output at up to XGA/SVGA resolution at typical quality settings.
+// Reduce this value if your target only has OV2640 and wants to save heap.
+#define MAX_FRAME_DMA_BUFFER_SIZE 131072
 
 static uint16_t frame_seq = 0;
 
@@ -106,7 +110,7 @@ bool setup_camera() {
     config.pin_pwdn = PWDN_GPIO_NUM;
     config.pin_reset = RESET_GPIO_NUM;
     config.xclk_freq_hz = 20000000;
-    config.pixel_format = PIXFORMAT_JPEG; // OV2640 Hardware JPEG is highly recommended
+    config.pixel_format = PIXFORMAT_JPEG;
     config.frame_size = FRAMESIZE_QVGA;   // Default start
     config.jpeg_quality = 12;
     config.fb_count = 2;                  // Use PSRAM for 2 buffers
@@ -116,6 +120,19 @@ bool setup_camera() {
         ESP_LOGE(TAG, "Camera init failed with error 0x%x", err);
         return false;
     }
+
+    // Apply OV3660-specific sensor settings.
+    // The esp_camera library auto-detects the sensor type via SCCB; these
+    // settings correct the default orientation and improve image quality for
+    // the OV3660 module. They are safe no-ops if a different sensor is fitted.
+    sensor_t *s = esp_camera_sensor_get();
+    if (s != NULL) {
+        s->set_vflip(s, 1);      // OV3660 image is upside-down by default
+        s->set_hmirror(s, 0);    // No horizontal mirror
+        s->set_brightness(s, 1); // Slightly brighter to compensate sensor tendency
+        s->set_contrast(s, 1);   // Slightly higher contrast for sharper edges
+    }
+
     ESP_LOGI(TAG, "Camera setup successfully");
     return true;
 }
@@ -158,7 +175,7 @@ void spi_slave_task(void *pvParameters) {
     // Allocate large continuous block for the whole image
     uint8_t *frame_dma_buf = (uint8_t *)heap_caps_malloc(MAX_FRAME_DMA_BUFFER_SIZE, MALLOC_CAP_DMA);
     if (!frame_dma_buf) {
-        ESP_LOGE(TAG, "Failed to allocate 60KB DMA buffer! Try reducing size or checking heap.");
+        ESP_LOGE(TAG, "Failed to allocate DMA buffer (%d bytes)! Try reducing MAX_FRAME_DMA_BUFFER_SIZE or checking heap.", MAX_FRAME_DMA_BUFFER_SIZE);
         vTaskDelete(NULL);
     }
 
@@ -194,10 +211,36 @@ void spi_slave_task(void *pvParameters) {
         bool trigger_capture = false;
         if (ack_buf->status == ACK_OK) {
             switch (cmd_buf->cmd_id) {
-                case CMD_ID_SET_FMT:
-                    // In a production system, you would call esp_camera_sensor_get()->set_framesize(sensor, framesize) here
-                    ESP_LOGI(TAG, "Master requested Format change");
+                case CMD_ID_SET_FMT: {
+                    // payload[0] = pixfmt, payload[1..2] = width (LE), payload[3..4] = height (LE), payload[5] = quality
+                    sensor_t *s = esp_camera_sensor_get();
+                    if (s != NULL && cmd_buf->len >= 6) {
+                        auto read_le16 = [](const uint8_t *b) -> uint16_t {
+                            return (uint16_t)b[0] | ((uint16_t)b[1] << 8);
+                        };
+                        uint16_t req_width  = read_le16(&cmd_buf->payload[1]);
+                        uint16_t req_height = read_le16(&cmd_buf->payload[3]);
+                        uint8_t  req_quality = cmd_buf->payload[5];
+
+                        // Map requested dimensions to the nearest esp_camera framesize
+                        framesize_t fs = FRAMESIZE_QVGA; // default fallback
+                        if      (req_width >= 1600) fs = FRAMESIZE_UXGA;
+                        else if (req_width >= 1280) fs = FRAMESIZE_SXGA;
+                        else if (req_width >= 1024) fs = FRAMESIZE_XGA;
+                        else if (req_width >= 800)  fs = FRAMESIZE_SVGA;
+                        else if (req_width >= 640)  fs = FRAMESIZE_VGA;
+                        else if (req_width >= 480)  fs = FRAMESIZE_HVGA;
+                        else if (req_width >= 320)  fs = FRAMESIZE_QVGA;
+                        else                        fs = FRAMESIZE_QQVGA;
+
+                        s->set_framesize(s, fs);
+                        s->set_quality(s, req_quality);
+                        ESP_LOGI(TAG, "Format set: %ux%u quality=%u", req_width, req_height, req_quality);
+                    } else {
+                        ESP_LOGW(TAG, "SET_FMT: sensor unavailable or payload too short");
+                    }
                     break;
+                }
                 case CMD_ID_CAPTURE_ONCE:
                     ESP_LOGI(TAG, "Master requested CAPTURE_ONCE");
                     trigger_capture = true;
