@@ -84,8 +84,13 @@ int send_command_and_wait_ack(spi_command_t* cmd, spi_ack_t* ack) {
     spi_transfer_block((uint8_t*)cmd, NULL, sizeof(spi_command_t));
     spi_cs_high(); // Crucial: terminate the command transfer
     
-    // Wait a short time for slave's FreeRTOS task to process command and queue ACK
-    delay_ms(2); 
+    // Wait for slave to signal that the ACK is ready in its SPI queue.
+    // Using the handshake pin avoids the data-shift caused by a fixed delay
+    // that may expire before the slave has loaded data into the shift register.
+    if (!wait_for_slave_ready(100)) { // 100ms timeout for ACK
+        printf("Timeout waiting for ACK!\n");
+        return -1;
+    }
 
     spi_cs_low(); // Begin new transaction for ACK
     spi_transfer_block(NULL, (uint8_t*)ack, sizeof(spi_ack_t));
