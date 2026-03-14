@@ -6,6 +6,7 @@
 #ifndef SPI_PROTOCOL_H
 #define SPI_PROTOCOL_H
 
+#include <stddef.h>
 #include <stdint.h>
 
 // Protocol Constants
