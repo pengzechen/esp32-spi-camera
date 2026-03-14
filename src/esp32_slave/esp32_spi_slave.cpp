@@ -163,6 +163,8 @@ void spi_slave_task(void *pvParameters) {
     }
 
     spi_slave_transaction_t trans_cmd, trans_ack, trans_data;
+    // Reused to retrieve each completed queued transaction (ACK, header, payload).
+    spi_slave_transaction_t *trans_result;
 
     while (1) {
         // 1. Wait for Master to send a command
@@ -212,10 +214,16 @@ void spi_slave_task(void *pvParameters) {
         ack_buf->crc8 = crc8((uint8_t*)ack_buf, sizeof(spi_ack_t) - 2);
 
         // 3. Send ACK to Master
+        // Queue the transaction into the SPI hardware BEFORE raising the handshake pin.
+        // This prevents the race condition where the master starts clocking before the
+        // slave has loaded data into the shift register, which causes a data shift.
         memset(&trans_ack, 0, sizeof(trans_ack));
         trans_ack.length = sizeof(spi_ack_t) * 8;
         trans_ack.tx_buffer = ack_buf;
-        spi_slave_transmit(SPI_HOST, &trans_ack, portMAX_DELAY);
+        ESP_ERROR_CHECK(spi_slave_queue_trans(SPI_HOST, &trans_ack, portMAX_DELAY));
+        gpio_set_level((gpio_num_t)GPIO_HANDSHAKE, 1); // Signal master: ACK is ready
+        ESP_ERROR_CHECK(spi_slave_get_trans_result(SPI_HOST, &trans_result, portMAX_DELAY));
+        gpio_set_level((gpio_num_t)GPIO_HANDSHAKE, 0);
 
         // 4. Handle requested data streams
         if (trigger_capture) {
@@ -240,13 +248,15 @@ void spi_slave_task(void *pvParameters) {
                 header_buf->header_crc32 = crc32((uint8_t*)header_buf, 20);
 
                 // Transmit Header
+                // Queue the transaction into the SPI hardware BEFORE raising the handshake
+                // pin so the master cannot start clocking before data is ready in the queue.
                 memset(&trans_data, 0, sizeof(trans_data));
                 trans_data.length = sizeof(spi_frame_header_t) * 8;
                 trans_data.tx_buffer = header_buf;
                 
-                // Set READY pin HIGH to tell master "Header is ready to be clocked out"
-                gpio_set_level((gpio_num_t)GPIO_HANDSHAKE, 1);
-                spi_slave_transmit(SPI_HOST, &trans_data, portMAX_DELAY);
+                ESP_ERROR_CHECK(spi_slave_queue_trans(SPI_HOST, &trans_data, portMAX_DELAY));
+                gpio_set_level((gpio_num_t)GPIO_HANDSHAKE, 1); // Signal master: Header is ready
+                ESP_ERROR_CHECK(spi_slave_get_trans_result(SPI_HOST, &trans_result, portMAX_DELAY));
                 gpio_set_level((gpio_num_t)GPIO_HANDSHAKE, 0); // Pull LOW after master reads
 
                 // Transmit Image payload in one single DMA shot (if it fits)
@@ -261,9 +271,10 @@ void spi_slave_task(void *pvParameters) {
                     trans_data.length = padded_len * 8; // length is in bits
                     trans_data.tx_buffer = frame_dma_buf;
                     
-                    // Set READY pin HIGH to tell master "Data payload is ready!"
-                    gpio_set_level((gpio_num_t)GPIO_HANDSHAKE, 1);
-                    spi_slave_transmit(SPI_HOST, &trans_data, portMAX_DELAY);
+                    // Queue BEFORE raising handshake to avoid the data-shift race condition.
+                    ESP_ERROR_CHECK(spi_slave_queue_trans(SPI_HOST, &trans_data, portMAX_DELAY));
+                    gpio_set_level((gpio_num_t)GPIO_HANDSHAKE, 1); // Signal master: Payload ready
+                    ESP_ERROR_CHECK(spi_slave_get_trans_result(SPI_HOST, &trans_result, portMAX_DELAY));
                     gpio_set_level((gpio_num_t)GPIO_HANDSHAKE, 0); // Pull LOW after transmission is done
                     
                     ESP_LOGI(TAG, "Frame sent successfully in one block.");
